@@ -1,0 +1,21 @@
+# Binaries
+xray-tester
+main
+
+# Data files
+result.json
+result.txt
+clean_ips.txt
+*.dat
+
+# Log files
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
