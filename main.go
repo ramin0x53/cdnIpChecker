@@ -253,17 +253,15 @@ func processBatch(ips []ScannedIP, template map[string]interface{}, basePort int
 		newRules = append(newRules, rule)
 	}
 
-	/*
-		if originalOuts, ok := batchConfig["outbounds"].([]interface{}); ok {
-			for _, out := range originalOuts {
-				m, _ := out.(map[string]interface{})
-				t, _ := m["tag"].(string)
-				if t != "proxy" && t != "" {
-					newOutbounds = append(newOutbounds, out)
-				}
+	if originalOuts, ok := batchConfig["outbounds"].([]interface{}); ok {
+		for _, out := range originalOuts {
+			m, _ := out.(map[string]interface{})
+			t, _ := m["tag"].(string)
+			if t != "proxy" && t != "" {
+				newOutbounds = append(newOutbounds, out)
 			}
 		}
-	*/
+	}
 
 	batchConfig["inbounds"] = newInbounds
 
