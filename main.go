@@ -53,6 +53,9 @@ func main() {
 		fmt.Fprintf(realStdout, format, a...)
 	}
 
+	// Ensure flag help output goes to real stdout since we silence stderr
+	flag.CommandLine.SetOutput(realStdout)
+
 	// Define CLI Flags
 	inputPath := flag.String("input", "result.json", "Path to the input JSON file")
 	flag.StringVar(inputPath, "i", "result.json", "Path to the input JSON file (shorthand)")
@@ -69,10 +72,27 @@ func main() {
 	retryCount := flag.Int("retry", 0, "Number of retries for failed connections")
 	flag.IntVar(retryCount, "r", 0, "Number of retries for failed connections (shorthand)")
 
-	batchSize := flag.Int("workers", 20, "Batch size (number of IPs to check in a single Xray instance)")
-	flag.IntVar(batchSize, "w", 20, "Batch size (shorthand)")
+	workerCount := flag.Int("workers", 20, "Number of concurrent workers")
+	flag.IntVar(workerCount, "w", 20, "Number of concurrent workers (shorthand)")
+
+	help := flag.Bool("help", false, "Show help message")
+	flag.BoolVar(help, "h", false, "Show help message (shorthand)")
+
+	flag.Usage = func() {
+		printLog("Usage of cdnIpChecker:\n")
+		printLog("  This tool checks a list of IPs against a V2Ray/Xray configuration to find working proxies.\n\n")
+		printLog("Flags:\n")
+		flag.PrintDefaults()
+		printLog("\nExample:\n")
+		printLog("  cdnIpChecker -i result.json -c config.json -o working.txt -w 50\n")
+	}
 
 	flag.Parse()
+
+	if *help {
+		flag.Usage()
+		os.Exit(0)
+	}
 
 	// 2. Setup asset location
 	cwd, err := os.Getwd()
@@ -138,36 +158,52 @@ func main() {
 		}
 	}
 
-	printLog("Using Base Port: %d. Batch Size: %d. Timeout: %ds. Retries: %d.\n", basePort, *batchSize, *timeoutSec, *retryCount)
-	printLog("Starting batched processing (Reports: [Index] IP: Latency/Error)...\n")
+	printLog("Using Base Port: %d. Workers: %d. Timeout: %ds. Retries: %d.\n", basePort, *workerCount, *timeoutSec, *retryCount)
+	printLog("Starting concurrent processing (Reports: [Index] IP: Latency/Error)...\n")
 	printLog("---------------------------------------------------\n")
 
+	// 7. Setup Worker Pool
+	jobs := make(chan ScannedIP, len(scannedIPs))
+	results := make(chan Result, len(scannedIPs))
+	var wg sync.WaitGroup
+
+	// Fill jobs
+	for _, ip := range scannedIPs {
+		jobs <- ip
+	}
+	close(jobs)
+
+	// Start workers
+	for w := 0; w < *workerCount; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			worker(id, jobs, results, configTemplate, basePort, *timeoutSec, *retryCount)
+		}(w)
+	}
+
+	// Closer goroutine
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
 	var workingIPs []string
-	total := len(scannedIPs)
 	processed := 0
+	total := len(scannedIPs)
 
-	// 7. Process in Batches
-	for i := 0; i < total; i += *batchSize {
-		end := i + *batchSize
-		if end > total {
-			end = total
-		}
-		batchIPs := scannedIPs[i:end]
-
-		results := processBatch(batchIPs, configTemplate, basePort, *timeoutSec, *retryCount)
-
-		for _, res := range results {
-			processed++
-			if res.Success {
-				printLog("[%d/%d] %s: ✅ PASS (%v)\n", processed, total, res.IP, res.Latency)
-				workingIPs = append(workingIPs, res.IP)
-			} else {
-				errMsg := fmt.Sprintf("%v", res.Error)
-				if len(errMsg) > 50 {
-					errMsg = errMsg[:47] + "..."
-				}
-				printLog("[%d/%d] %s: ❌ FAIL (%s)\n", processed, total, res.IP, errMsg)
+	// Collect results
+	for res := range results {
+		processed++
+		if res.Success {
+			printLog("[%d/%d] %s: ✅ PASS (%v)\n", processed, total, res.IP, res.Latency)
+			workingIPs = append(workingIPs, res.IP)
+		} else {
+			errMsg := fmt.Sprintf("%v", res.Error)
+			if len(errMsg) > 50 {
+				errMsg = errMsg[:47] + "..."
 			}
+			printLog("[%d/%d] %s: ❌ FAIL (%s)\n", processed, total, res.IP, errMsg)
 		}
 	}
 
@@ -195,123 +231,96 @@ func main() {
 	}
 }
 
-func processBatch(ips []ScannedIP, template map[string]interface{}, basePort int, timeoutSec int, retryCount int) []Result {
-	// Deep copy template for this batch
-	batchConfig := deepCopyMap(template)
-	suppressXrayLogging(batchConfig)
+func worker(id int, jobs <-chan ScannedIP, results chan<- Result, template map[string]interface{}, basePort, timeout, retry int) {
+	for ip := range jobs {
+		res := processIP(id, ip, template, basePort, timeout, retry)
+		results <- res
+	}
+}
+
+func processIP(workerID int, ipData ScannedIP, template map[string]interface{}, basePort, timeoutSec, retryCount int) Result {
+	// Deep copy template for this check
+	ipConfig := deepCopyMap(template)
+	suppressXrayLogging(ipConfig)
 
 	// Prepare structures
-	tmplInbound, tmplOutbound := extractTemplates(batchConfig)
+	tmplInbound, tmplOutbound := extractTemplates(ipConfig)
 	if tmplInbound == nil || tmplOutbound == nil {
-		return makeFailResults(ips, fmt.Errorf("invalid config template"))
+		return Result{IP: ipData.IP, Success: false, Error: fmt.Errorf("invalid config template")}
 	}
 
-	newInbounds := []interface{}{}
-	// Initialize outbounds with a Blackhole as the first entry (default fallback).
-	// This prevents Xray from falling back to out-0 (which might be a working proxy)
-	// if a specific outbound fails or routing is ambiguous.
+	// Calculate unique port for this worker
+	port := basePort + workerID + 1
+
+	// 1. Create Inbound
+	newInbound := deepCopyMap(tmplInbound)
+	newInbound["port"] = port
+	newInbound["listen"] = "127.0.0.1"
+	newInbound["tag"] = "in-worker"
+
+	// 2. Create Outbound
+	newOutbound := deepCopyMap(tmplOutbound)
+	if err := setOutboundAddress(newOutbound, ipData.IP); err != nil {
+		return Result{IP: ipData.IP, Success: false, Error: err}
+	}
+	newOutbound["tag"] = "out-worker"
+
+	// Fallback
 	blackhole := map[string]interface{}{
 		"tag":      "fallback-blackhole",
 		"protocol": "blackhole",
 	}
-	newOutbounds := []interface{}{blackhole}
 
-	newRules := []interface{}{}
+	ipConfig["inbounds"] = []interface{}{newInbound}
+	ipConfig["outbounds"] = []interface{}{blackhole, newOutbound} // Blackhole first
 
+	// 3. Routing
+	routing, _ := ipConfig["routing"].(map[string]interface{})
+	if routing == nil {
+		routing = make(map[string]interface{})
+		ipConfig["routing"] = routing
+	}
+
+	rule := map[string]interface{}{
+		"type":        "field",
+		"inboundTag":  []interface{}{"in-worker"},
+		"outboundTag": "out-worker",
+	}
+
+	existingRules, _ := routing["rules"].([]interface{})
+	routing["rules"] = append([]interface{}{rule}, existingRules...)
+
+	// Build Config
+	configBytes, _ := json.Marshal(ipConfig)
+	coreConfig, err := serial.LoadJSONConfig(bytes.NewReader(configBytes))
+	if err != nil {
+		return Result{IP: ipData.IP, Success: false, Error: fmt.Errorf("config build error: %v", err)}
+	}
+
+	// Start Xray
+	instance, err := core.New(coreConfig)
+	if err != nil {
+		return Result{IP: ipData.IP, Success: false, Error: fmt.Errorf("core create error: %v", err)}
+	}
+	if err := instance.Start(); err != nil {
+		return Result{IP: ipData.IP, Success: false, Error: fmt.Errorf("core start error: %v", err)}
+	}
+	// Important: Stop the instance when done to release the port
+	defer instance.Close()
+
+	// Wait for port (briefly)
+	if !waitForPort(port, 2*time.Second) {
+		// Just try anyway, sometimes detection is flaky
+	}
+
+	// Test
 	testerProtocol := "socks"
 	if p, ok := tmplInbound["protocol"].(string); ok {
 		testerProtocol = p
 	}
 
-	for idx, ipData := range ips {
-		port := basePort + idx + 1
-		tagSuffix := fmt.Sprintf("-%d", idx)
-		inTag := "in" + tagSuffix
-		outTag := "out" + tagSuffix
-
-		// 1. Create Inbound
-		inbound := deepCopyMap(tmplInbound)
-		inbound["port"] = port
-		inbound["tag"] = inTag
-		inbound["listen"] = "127.0.0.1"
-		newInbounds = append(newInbounds, inbound)
-
-		// 2. Create Outbound
-		outbound := deepCopyMap(tmplOutbound)
-		outbound["tag"] = outTag
-		if err := setOutboundAddress(outbound, ipData.IP); err != nil {
-			continue
-		}
-		newOutbounds = append(newOutbounds, outbound)
-
-		// 3. Create Routing Rule
-		rule := map[string]interface{}{
-			"type":        "field",
-			"inboundTag":  []interface{}{inTag},
-			"outboundTag": outTag,
-		}
-		newRules = append(newRules, rule)
-	}
-
-	if originalOuts, ok := batchConfig["outbounds"].([]interface{}); ok {
-		for _, out := range originalOuts {
-			m, _ := out.(map[string]interface{})
-			t, _ := m["tag"].(string)
-			if t != "proxy" && t != "" {
-				newOutbounds = append(newOutbounds, out)
-			}
-		}
-	}
-
-	batchConfig["inbounds"] = newInbounds
-
-	batchConfig["outbounds"] = newOutbounds
-
-	routing, _ := batchConfig["routing"].(map[string]interface{})
-
-	if routing == nil {
-
-		routing = make(map[string]interface{})
-		batchConfig["routing"] = routing
-	}
-	existingRules, _ := routing["rules"].([]interface{})
-	routing["rules"] = append(newRules, existingRules...)
-
-	configBytes, _ := json.Marshal(batchConfig)
-	coreConfig, err := serial.LoadJSONConfig(bytes.NewReader(configBytes))
-	if err != nil {
-		return makeFailResults(ips, fmt.Errorf("config build error: %v", err))
-	}
-
-	instance, err := core.New(coreConfig)
-	if err != nil {
-		return makeFailResults(ips, fmt.Errorf("core create error: %v", err))
-	}
-	if err := instance.Start(); err != nil {
-		return makeFailResults(ips, fmt.Errorf("core start error: %v", err))
-	}
-	defer instance.Close()
-
-	lastPort := basePort + len(ips)
-	if !waitForPort(lastPort, 3*time.Second) {
-		// Log warning
-	}
-
-	var wg sync.WaitGroup
-	batchResults := make([]Result, len(ips))
-
-	for i, ipData := range ips {
-		wg.Add(1)
-		go func(idx int, ipStr string) {
-			defer wg.Done()
-			port := basePort + idx + 1
-			latency, err := testProxy("127.0.0.1", port, testerProtocol, timeoutSec, retryCount)
-			batchResults[idx] = Result{IP: ipStr, Success: err == nil, Latency: latency, Error: err}
-		}(i, ipData.IP)
-	}
-	wg.Wait()
-
-	return batchResults
+	latency, err := testProxy("127.0.0.1", port, testerProtocol, timeoutSec, retryCount)
+	return Result{IP: ipData.IP, Success: err == nil, Latency: latency, Error: err}
 }
 
 func extractTemplates(config map[string]interface{}) (map[string]interface{}, map[string]interface{}) {
@@ -376,14 +385,6 @@ func deepCopyMap(m map[string]interface{}) map[string]interface{} {
 	b, _ := json.Marshal(m)
 	json.Unmarshal(b, &copy)
 	return copy
-}
-
-func makeFailResults(ips []ScannedIP, err error) []Result {
-	res := make([]Result, len(ips))
-	for i, ip := range ips {
-		res[i] = Result{IP: ip.IP, Success: false, Error: err}
-	}
-	return res
 }
 
 func waitForPort(port int, timeout time.Duration) bool {
